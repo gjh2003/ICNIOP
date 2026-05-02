@@ -1,0 +1,61 @@
+# Data
+BMC_dataset/
+saved_features/
+*.zip
+*.tar.gz
+*.tar
+*.7z
+
+# Outputs
+checkpoints/
+results/
+logs/
+
+# Pretrained weights & data files
+*.pth
+*.pth.tmp
+*.npy
+*.npz
+*.pkl
+
+# Old / experimental scripts and packages (legacy code, kept locally)
+alg_validation/
+nash_bidding/
+moe_game_model.pth
+run_ablation_routing.py
+run_experiment.py
+run_game_v2.py
+run_improved.py
+run_pbc.py
+test.py
+
+# LaTeX templates (downloaded, not part of project)
+LaTeX2e+Proceedings+Templates+download/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude / AI assistant
+.claude/
+
+# Local config
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
