@@ -244,26 +244,42 @@ def phase1(args, run_name, backbone, head, train_loader, val_loader,
 # ===================== Phase 2 =====================
 def train_crt_expert(args, expert_name, backbone, p1_head, balanced_loader, val_loader,
                      class_names, priors, device, logger, run_name, num_classes):
-    """cRT (classifier Re-Training): init from P1, fine-tune classifier on balanced data.
+    """cRT (classifier Re-Training): init from P1, fine-tune ONLY THE LAST LINEAR
+    LAYER on balanced data.
 
     Reference: Kang et al. ICLR 2020 - Decoupling Representation and Classifier
     for Long-Tailed Recognition.
 
-    Key differences from training-from-scratch:
-      - Initialize from P1's classifier head (already strong)
-      - Only a few epochs (crt_epochs, default 10)
-      - Smaller learning rate (crt_lr = 1e-4, 10x smaller than P1's head_lr)
-      - Use balanced sampler + weighted CE
+    Important: original cRT *only retrains the last fully-connected layer*.
+    Letting the entire ClassifierHead (3-layer MLP, ~660K params) update was
+    found to over-correct: even with standard CE + balanced sampler, Macro F1
+    dropped from 0.7570 to 0.67 within 1 epoch. We now freeze hidden layers
+    and only update the final Linear(256, num_classes), reducing trainable
+    params to ~5K.
     """
     head = copy.deepcopy(p1_head)
-    optimizer = torch.optim.AdamW(head.parameters(), lr=args.crt_lr,
-                                   weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.crt_epochs, eta_min=1e-6)
 
-    # cRT (Kang et al. ICLR 2020) uses balanced sampling + STANDARD CE.
-    # Adding weighted CE on top would double-penalize head classes (the
-    # balanced sampler already gives rare classes equal chance to appear).
-    # Using weighted CE here previously caused Macro F1 to drop from 0.7458 to 0.5933.
+    # Freeze hidden layers, train ONLY the final Linear layer.
+    # ClassifierHead structure: net = Sequential(
+    #   [0] Linear(in, 512), [1] ReLU, [2] Dropout,
+    #   [3] Linear(512, 256), [4] ReLU, [5] Dropout,
+    #   [6] Linear(256, num_classes)  <-- only this one trainable
+    # )
+    for p in head.parameters():
+        p.requires_grad = False
+    final_layer = head.net[-1]
+    for p in final_layer.parameters():
+        p.requires_grad = True
+
+    trainable_params = [p for p in head.parameters() if p.requires_grad]
+    n_trainable = sum(p.numel() for p in trainable_params)
+    n_total = sum(p.numel() for p in head.parameters())
+    logger.info(f"  cRT: {n_trainable}/{n_total} params trainable (only final Linear)")
+
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.crt_lr,
+                                   weight_decay=args.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.crt_epochs, eta_min=1e-7)
+
     crt_loss_fn = nn.CrossEntropyLoss()
 
     history = History()
