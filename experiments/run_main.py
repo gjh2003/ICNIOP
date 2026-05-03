@@ -352,6 +352,7 @@ def train_crt_expert(args, expert_name, backbone, p1_head, balanced_loader, val_
         head.load_state_dict(early.best_state)
 
     save_dir = os.path.join(RESULTS_DIR, run_name)
+    os.makedirs(save_dir, exist_ok=True)
     history.save_json(os.path.join(save_dir, f"p2_{expert_name}_history.json"))
     history.plot_curves(os.path.join(save_dir, f"p2_{expert_name}_curves.png"))
     return head
