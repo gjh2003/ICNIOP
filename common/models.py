@@ -68,3 +68,24 @@ class BiddingNetwork(nn.Module):
 
     def forward(self, x):
         return self.net(x).squeeze(-1)
+
+
+class PostHocLAHead(nn.Module):
+    """Post-hoc Logit Adjustment wrapper.
+
+    Wraps a base ClassifierHead and adds tau * log(prior) at inference time.
+    No training needed — this implements Logit Adjustment (Menon et al., ICLR 2021)
+    as an inference-time correction.
+    """
+
+    def __init__(self, base_head: nn.Module, log_priors: torch.Tensor, tau: float = 1.0):
+        super().__init__()
+        self.base_head = base_head
+        # Note: the LA correction at INFERENCE actually SUBTRACTS tau*log(pi)
+        # from the logits, NOT adds. This shifts the decision boundary toward
+        # rare classes (since their log_pi is very negative, subtracting makes
+        # their adjusted logit more competitive).
+        self.register_buffer("la_shift", -tau * log_priors)
+
+    def forward(self, x):
+        return self.base_head(x) + self.la_shift

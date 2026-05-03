@@ -12,11 +12,20 @@
 set -e
 
 # ============== Tier 0: Main + Core Baselines ==============
+#
+# IMPORTANT: After the architecture redesign (Expert A=P1, B=cRT, C=PostHocLA),
+# Phase 1 is reused across ALL Phase 2/3 variants. The first run trains
+# backbone+P1 head (~3-4h on 5090). Subsequent ablations should use --skip_p1
+# to save 3-4h each.
+#
+# The baseline `run_baseline.py --method ce` produces THE SAME backbone training
+# as run_main's Phase 1, so we run it FIRST and let run_main reuse its checkpoint.
+# Actually no — they save under different names. We just train run_main first.
 
-echo "[Tier 0.1] MLL Main Method..."
+echo "[Tier 0.1] MLL Main Method (trains P1 backbone + builds 3 derived experts + bidding game)..."
 python -m experiments.run_main --dataset mll --backbone swin_t --resume
 
-echo "[Tier 0.2] MLL Baselines..."
+echo "[Tier 0.2] MLL Baselines (each trains its own backbone independently for fair comparison)..."
 python -m experiments.run_baseline --dataset mll --method ce --resume
 python -m experiments.run_baseline --dataset mll --method weighted_ce --resume
 python -m experiments.run_baseline --dataset mll --method focal --resume

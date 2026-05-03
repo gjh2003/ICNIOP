@@ -35,7 +35,7 @@ from common.train_utils import (
     History, compute_lt_metrics, set_seed,
 )
 from common.data import build_dataset
-from common.models import build_backbone, ClassifierHead, BiddingNetwork
+from common.models import build_backbone, ClassifierHead, BiddingNetwork, PostHocLAHead
 
 
 def parse_args():
@@ -52,11 +52,16 @@ def parse_args():
     p.add_argument("--p1_backbone_lr", type=float, default=1e-5)
     p.add_argument("--p1_head_lr", type=float, default=1e-3)
 
-    # Phase 2: expert pre-training
-    p.add_argument("--p2_max_epochs", type=int, default=30)
-    p.add_argument("--p2_patience", type=int, default=7)
+    # Phase 2: expert pre-training (NEW: cRT-style, derived from P1)
+    # Expert A = P1 head (no retraining)
+    # Expert B = P1 head + cRT fine-tuning on balanced data
+    # Expert C = P1 head + post-hoc Logit Adjustment (no training)
+    p.add_argument("--crt_epochs", type=int, default=10,
+                   help="cRT epochs for Expert B (small, since starting from P1)")
+    p.add_argument("--crt_patience", type=int, default=4)
+    p.add_argument("--crt_lr", type=float, default=1e-4,
+                   help="cRT lr (small, only perturbing P1 head)")
     p.add_argument("--p2_batch", type=int, default=64)
-    p.add_argument("--p2_lr", type=float, default=1e-3)
 
     # Phase 3: bidding game
     p.add_argument("--p3_max_epochs", type=int, default=30)
@@ -237,6 +242,103 @@ def phase1(args, run_name, backbone, head, train_loader, val_loader,
 
 
 # ===================== Phase 2 =====================
+def train_crt_expert(args, expert_name, backbone, p1_head, balanced_loader, val_loader,
+                     class_names, priors, device, logger, run_name, num_classes):
+    """cRT (classifier Re-Training): init from P1, fine-tune classifier on balanced data.
+
+    Reference: Kang et al. ICLR 2020 - Decoupling Representation and Classifier
+    for Long-Tailed Recognition.
+
+    Key differences from training-from-scratch:
+      - Initialize from P1's classifier head (already strong)
+      - Only a few epochs (crt_epochs, default 10)
+      - Smaller learning rate (crt_lr = 1e-4, 10x smaller than P1's head_lr)
+      - Use balanced sampler + weighted CE
+    """
+    head = copy.deepcopy(p1_head)
+    optimizer = torch.optim.AdamW(head.parameters(), lr=args.crt_lr,
+                                   weight_decay=args.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.crt_epochs, eta_min=1e-6)
+
+    # Weighted CE
+    w = 1.0 / priors; w = w / w.sum() * num_classes
+    wce_fn = nn.CrossEntropyLoss(weight=w.to(device))
+
+    history = History()
+    early = EarlyStopping(patience=args.crt_patience, mode="max")
+    start_epoch = 1
+
+    resume_path = os.path.join(CHECKPOINT_DIR, f"{run_name}_p2_{expert_name}_resume.pth")
+    if args.resume:
+        ckpt = load_resume_checkpoint(resume_path)
+        if ckpt is not None:
+            head.load_state_dict(ckpt["head"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            history.records = ckpt["history"]
+            early.best_value = ckpt["best_f1"]
+            early.best_epoch = ckpt["best_epoch"]
+            early.counter = ckpt["patience_counter"]
+            early.best_state = ckpt.get("best_state")
+            start_epoch = ckpt["epoch"] + 1
+            logger.info(f"  [{expert_name} RESUME] from epoch {ckpt['epoch']}")
+
+    # Initial val (P1 head's performance, before any cRT)
+    if start_epoch == 1:
+        init_val = eval_single(backbone, head, val_loader, class_names, priors, device,
+                               tag=f"{expert_name} init (=P1)")
+        logger.info(f"  {expert_name} init macro_f1={init_val['macro_f1']:.4f}")
+
+    for epoch in range(start_epoch, args.crt_epochs + 1):
+        head.train()
+        correct = total = 0; loss_sum = 0.0
+        pbar = tqdm(balanced_loader, desc=f"  {expert_name} E{epoch}/{args.crt_epochs}", ncols=100)
+        for imgs, labels in pbar:
+            imgs, labels = imgs.to(device), labels.to(device)
+            with torch.no_grad():
+                feats = backbone(imgs)
+            logits = head(feats)
+            loss = wce_fn(logits, labels)
+            optimizer.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            optimizer.step()
+            loss_sum += loss.item() * imgs.size(0)
+            correct += (logits.argmax(1) == labels).sum().item()
+            total += imgs.size(0)
+            pbar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{100*correct/total:.1f}%")
+        scheduler.step()
+
+        val_metrics = eval_single(backbone, head, val_loader, class_names, priors, device,
+                                  tag=f"{expert_name} E{epoch} val")
+        history.append(epoch, train_loss=loss_sum/total, train_acc=correct/total,
+                       val_acc=val_metrics["acc"], val_macro_f1=val_metrics["macro_f1"],
+                       val_tail_f1=val_metrics["tail_f1"], val_head_f1=val_metrics["head_f1"])
+
+        is_best = early.step(val_metrics["macro_f1"], epoch,
+                             state=copy.deepcopy(head.state_dict()))
+        if is_best:
+            logger.info(f"  {expert_name} E{epoch} *best* macro_f1={val_metrics['macro_f1']:.4f}")
+        else:
+            logger.info(f"  {expert_name} E{epoch} (patience {early.counter}/{args.crt_patience})")
+
+        save_resume_checkpoint(resume_path, epoch=epoch, head=head.state_dict(),
+                               optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
+                               history=history.records,
+                               best_f1=early.best_value, best_epoch=early.best_epoch,
+                               patience_counter=early.counter, best_state=early.best_state)
+        if early.should_stop:
+            logger.info(f"  {expert_name} Early stopping at E{epoch}")
+            break
+
+    if early.best_state is not None:
+        head.load_state_dict(early.best_state)
+
+    save_dir = os.path.join(RESULTS_DIR, run_name)
+    history.save_json(os.path.join(save_dir, f"p2_{expert_name}_history.json"))
+    history.plot_curves(os.path.join(save_dir, f"p2_{expert_name}_curves.png"))
+    return head
+
+
 def train_one_expert(args, expert_name, backbone, loader, val_loader, loss_fn,
                      class_names, priors, device, logger, run_name, num_classes):
     head = ClassifierHead(in_dim=backbone.feat_dim, num_classes=num_classes).to(device)
@@ -310,10 +412,19 @@ def train_one_expert(args, expert_name, backbone, loader, val_loader, loss_fn,
     return head
 
 
-def phase2(args, run_name, backbone, train_loader, balanced_loader, val_loader,
+def phase2(args, run_name, backbone, p1_head, balanced_loader, val_loader,
            class_names, priors, device, logger, num_classes):
+    """New Phase 2: experts derived from P1 (decoupled training paradigm).
+
+    - Expert A: P1 head (no retraining) - head specialist baseline
+    - Expert B: cRT - P1 head fine-tuned on balanced data with weighted CE - tail boost
+    - Expert C: Post-hoc Logit Adjustment - P1 head + tau*log(pi) shift at inference - rare class boost
+    """
     logger.info("\n" + "=" * 70)
-    logger.info(f"  PHASE 2: Expert Pre-training (max {args.p2_max_epochs} epochs each)")
+    logger.info(f"  PHASE 2: Decoupled Expert Construction")
+    logger.info(f"    Expert A = P1 head (no retraining)")
+    logger.info(f"    Expert B = cRT ({args.crt_epochs} epochs, lr={args.crt_lr})")
+    logger.info(f"    Expert C = Post-hoc LA (tau={args.la_tau}, no training)")
     logger.info("=" * 70)
 
     # Freeze backbone
@@ -323,29 +434,33 @@ def phase2(args, run_name, backbone, train_loader, balanced_loader, val_loader,
     priors_dev = priors.to(device)
     log_priors = torch.log(priors_dev + 1e-8)
 
-    # Expert A: Standard CE
-    logger.info("\n  --- Expert A: Standard CE ---")
-    ce_fn = nn.CrossEntropyLoss()
-    expert_a = train_one_expert(args, "ExpertA", backbone, train_loader, val_loader,
-                                ce_fn, class_names, priors, device, logger, run_name, num_classes)
+    # ========== Expert A: P1 head (no retraining) ==========
+    logger.info("\n  --- Expert A: P1 head (cloned, no retraining) ---")
+    expert_a = copy.deepcopy(p1_head)
+    expert_a.eval()
+    for p in expert_a.parameters():
+        p.requires_grad = False
 
-    # Expert B: Weighted CE + Balanced Sampling
-    logger.info("\n  --- Expert B: Weighted CE + Balanced Sampling ---")
-    w = 1.0 / priors; w = w / w.sum() * num_classes
-    wce_fn = nn.CrossEntropyLoss(weight=w.to(device))
-    expert_b = train_one_expert(args, "ExpertB", backbone, balanced_loader, val_loader,
-                                wce_fn, class_names, priors, device, logger, run_name, num_classes)
+    # ========== Expert B: cRT fine-tuning ==========
+    logger.info("\n  --- Expert B: cRT (Decoupled Training, ICLR 2020) ---")
+    expert_b = train_crt_expert(args, "ExpertB_cRT", backbone, p1_head,
+                                 balanced_loader, val_loader,
+                                 class_names, priors, device, logger, run_name, num_classes)
+    expert_b.eval()
+    for p in expert_b.parameters():
+        p.requires_grad = False
 
-    # Expert C: Logit Adjustment
-    logger.info("\n  --- Expert C: Logit Adjustment ---")
-    def la_loss(logits, labels):
-        return F.cross_entropy(logits + args.la_tau * log_priors, labels)
-    expert_c = train_one_expert(args, "ExpertC", backbone, train_loader, val_loader,
-                                la_loss, class_names, priors, device, logger, run_name, num_classes)
+    # ========== Expert C: Post-hoc Logit Adjustment ==========
+    logger.info("\n  --- Expert C: Post-hoc Logit Adjustment (no training) ---")
+    expert_c = PostHocLAHead(copy.deepcopy(p1_head), log_priors, tau=args.la_tau).to(device)
+    expert_c.eval()
+    for p in expert_c.parameters():
+        p.requires_grad = False
 
-    # Save final experts
-    for i, e in enumerate([expert_a, expert_b, expert_c]):
-        torch.save(e.state_dict(), os.path.join(CHECKPOINT_DIR, f"{run_name}_expert_{i}.pth"))
+    # Save final experts (Expert C saves both base_head + la_shift buffer)
+    torch.save(expert_a.state_dict(), os.path.join(CHECKPOINT_DIR, f"{run_name}_expert_0.pth"))
+    torch.save(expert_b.state_dict(), os.path.join(CHECKPOINT_DIR, f"{run_name}_expert_1.pth"))
+    torch.save(expert_c.state_dict(), os.path.join(CHECKPOINT_DIR, f"{run_name}_expert_2.pth"))
 
     return [expert_a, expert_b, expert_c]
 
@@ -556,20 +671,40 @@ def main():
 
     # Phase 2
     if args.skip_p2:
-        experts = []
-        for i in range(3):
-            h = ClassifierHead(in_dim=backbone.feat_dim, num_classes=data["num_classes"]).to(device)
-            h.load_state_dict(torch.load(
-                os.path.join(CHECKPOINT_DIR, f"{run_name}_expert_{i}.pth"),
-                map_location=device, weights_only=True))
-            experts.append(h)
-        logger.info(f"  [SKIP P2] Loaded 3 experts")
+        # Load all 3 experts (Expert C is PostHocLAHead, others are ClassifierHead)
+        log_priors_dev = torch.log(data["priors"].to(device) + 1e-8)
+
+        # Expert A: ClassifierHead
+        expert_a = ClassifierHead(in_dim=backbone.feat_dim, num_classes=data["num_classes"]).to(device)
+        expert_a.load_state_dict(torch.load(
+            os.path.join(CHECKPOINT_DIR, f"{run_name}_expert_0.pth"),
+            map_location=device, weights_only=True))
+
+        # Expert B: ClassifierHead
+        expert_b = ClassifierHead(in_dim=backbone.feat_dim, num_classes=data["num_classes"]).to(device)
+        expert_b.load_state_dict(torch.load(
+            os.path.join(CHECKPOINT_DIR, f"{run_name}_expert_1.pth"),
+            map_location=device, weights_only=True))
+
+        # Expert C: PostHocLAHead wrapping a ClassifierHead
+        c_base = ClassifierHead(in_dim=backbone.feat_dim, num_classes=data["num_classes"]).to(device)
+        expert_c = PostHocLAHead(c_base, log_priors_dev, tau=args.la_tau).to(device)
+        expert_c.load_state_dict(torch.load(
+            os.path.join(CHECKPOINT_DIR, f"{run_name}_expert_2.pth"),
+            map_location=device, weights_only=True))
+
+        for e in (expert_a, expert_b, expert_c):
+            e.eval()
+            for p in e.parameters():
+                p.requires_grad = False
+        experts = [expert_a, expert_b, expert_c]
+        logger.info(f"  [SKIP P2] Loaded 3 experts (A=P1, B=cRT, C=PostHocLA)")
     else:
         # P2 uses larger batch
         data_p2 = build_dataset(args.dataset, args.variant, args.imb_factor,
                                 args.p2_batch, args.seed, args.num_workers)
-        experts = phase2(args, run_name, backbone,
-                         data_p2["train_loader"], data_p2["balanced_loader"], data_p2["val_loader"],
+        experts = phase2(args, run_name, backbone, p1_head,
+                         data_p2["balanced_loader"], data_p2["val_loader"],
                          data["class_names"], data["priors"], device, logger, data["num_classes"])
 
     # Test each expert
