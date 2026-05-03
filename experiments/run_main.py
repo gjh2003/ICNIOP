@@ -260,9 +260,11 @@ def train_crt_expert(args, expert_name, backbone, p1_head, balanced_loader, val_
                                    weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.crt_epochs, eta_min=1e-6)
 
-    # Weighted CE
-    w = 1.0 / priors; w = w / w.sum() * num_classes
-    wce_fn = nn.CrossEntropyLoss(weight=w.to(device))
+    # cRT (Kang et al. ICLR 2020) uses balanced sampling + STANDARD CE.
+    # Adding weighted CE on top would double-penalize head classes (the
+    # balanced sampler already gives rare classes equal chance to appear).
+    # Using weighted CE here previously caused Macro F1 to drop from 0.7458 to 0.5933.
+    crt_loss_fn = nn.CrossEntropyLoss()
 
     history = History()
     early = EarlyStopping(patience=args.crt_patience, mode="max")
@@ -298,7 +300,7 @@ def train_crt_expert(args, expert_name, backbone, p1_head, balanced_loader, val_
             with torch.no_grad():
                 feats = backbone(imgs)
             logits = head(feats)
-            loss = wce_fn(logits, labels)
+            loss = crt_loss_fn(logits, labels)
             optimizer.zero_grad(); loss.backward()
             nn.utils.clip_grad_norm_(head.parameters(), 1.0)
             optimizer.step()
