@@ -103,6 +103,8 @@ def parse_args():
     p.add_argument("--tblf_alphas", type=str, default="0.0,0.1,0.2,0.3,0.5",
                    help="Fixed-α TBLF sweep on the finetuned model")
 
+    p.add_argument("--balanced", action="store_true",
+                   help="Use class-balanced sampler (recommended for AKDF)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--resume", action="store_true")
@@ -254,7 +256,8 @@ def main():
     logger.info("[1] Loading data...")
     data = build_dataset(args.dataset, args.variant, args.imb_factor,
                          args.batch_size, args.seed, args.num_workers)
-    train_loader = data["train_loader"]
+    train_loader = data["balanced_loader"] if args.balanced else data["train_loader"]
+    logger.info(f"  train_loader: {'BALANCED (class-weighted sampler)' if args.balanced else 'natural distribution'}")
     val_loader = data["val_loader"]
     test_loader = data["test_loader"]
     priors = data["priors"]
