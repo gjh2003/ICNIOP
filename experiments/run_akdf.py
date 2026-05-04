@@ -80,10 +80,13 @@ def parse_args():
     p.add_argument("--tail_threshold", type=int, default=500)
 
     # AKDF hyperparameters
-    p.add_argument("--kd_beta", type=float, default=0.7,
-                   help="Weight on KL term for tail samples (0=pure CE, 1=pure mimicry)")
+    p.add_argument("--kd_beta", type=float, default=0.3,
+                   help="Weight on KD term for tail samples (0=pure CE, 1=pure mimicry)")
     p.add_argument("--kd_temperature", type=float, default=2.0,
                    help="Temperature for KD softmax (T>1 softens distributions)")
+    p.add_argument("--kd_type", default="mse", choices=["mse", "kl"],
+                   help="KD form: mse on tail logits (scale-preserving) or kl "
+                        "on tail-subspace softmax (scale-invariant, can collapse)")
     p.add_argument("--ls_eps", type=float, default=0.1,
                    help="Label smoothing epsilon for head samples")
 
@@ -138,7 +141,7 @@ def load_frozen_tfe(name, device, feat_dim, n_tail):
 # ===================== Asymmetric loss =====================
 def akdf_loss(student_logits, labels, teacher_tfe_logits,
               tail_indices_tensor, is_tail_mask,
-              kd_beta, kd_temp, ls_eps):
+              kd_beta, kd_temp, ls_eps, kd_type="mse"):
     """
     student_logits: (B, K)
     labels: (B,)
@@ -167,14 +170,21 @@ def akdf_loss(student_logits, labels, teacher_tfe_logits,
 
         ce_t = F.cross_entropy(t_logits, t_labels)
 
-        # Restrict student logits to tail positions for KL
+        # Student tail logits at the positions corresponding to tail classes
         student_tail_logits = t_logits.index_select(1, tail_indices_tensor)  # (n_tail_b, n_tail)
-        # Temperature-softened distributions
-        student_log_p = F.log_softmax(student_tail_logits / kd_temp, dim=1)
-        teacher_p = F.softmax(t_teacher / kd_temp, dim=1)
-        kl = F.kl_div(student_log_p, teacher_p, reduction="batchmean") * (kd_temp ** 2)
+        if kd_type == "mse":
+            # Scale-preserving: forces absolute logit values to match teacher's.
+            # Teacher TFE logits live in their own scale; we normalise both by
+            # subtracting per-sample mean so we match the *shape* not absolute level.
+            s_centered = student_tail_logits - student_tail_logits.mean(dim=1, keepdim=True)
+            t_centered = t_teacher - t_teacher.mean(dim=1, keepdim=True)
+            kd = F.mse_loss(s_centered, t_centered)
+        else:  # "kl" — original (collapses)
+            student_log_p = F.log_softmax(student_tail_logits / kd_temp, dim=1)
+            teacher_p = F.softmax(t_teacher / kd_temp, dim=1)
+            kd = F.kl_div(student_log_p, teacher_p, reduction="batchmean") * (kd_temp ** 2)
 
-        t_loss = (1 - kd_beta) * ce_t + kd_beta * kl
+        t_loss = (1 - kd_beta) * ce_t + kd_beta * kd
     else:
         t_loss = torch.tensor(0.0, device=device)
 
@@ -336,7 +346,7 @@ def main():
             loss, hl, tl = akdf_loss(s_logits, labels, t_logits,
                                       tail_idx_tensor, is_tail_mask,
                                       args.kd_beta, args.kd_temperature,
-                                      args.ls_eps)
+                                      args.ls_eps, args.kd_type)
 
             optimizer.zero_grad()
             loss.backward()
