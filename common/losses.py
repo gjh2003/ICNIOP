@@ -157,7 +157,7 @@ class GALALoss(nn.Module):
 
 
 def gala_loss(class_priors, device, num_classes, tau: float = 1.0, eta: float = 0.5):
-    return GALALoss(class_priors.to(device), num_classes, tau=tau, eta=eta)
+    return GALALoss(class_priors.to(device), num_classes, tau=tau, eta=eta).to(device)
 
 
 # ===================== Loss Builder =====================
