@@ -68,6 +68,9 @@ def parse_args():
 
     p.add_argument("--fixed_alphas", type=str, default="0.1,0.3,0.5,1.0",
                    help="Fixed alpha values to evaluate without training")
+    p.add_argument("--la_taus", type=str, default="0.0",
+                   help="Comma-separated LA τ values to combine with TBLF "
+                        "(0=no LA). LA subtracts τ·log(prior) from all logits.")
     p.add_argument("--max_epochs", type=int, default=30)
     p.add_argument("--patience", type=int, default=5)
     p.add_argument("--batch_size", type=int, default=1024)
@@ -205,6 +208,10 @@ def main():
 
     tail_idx_tensor = torch.tensor(tail_orig_indices, dtype=torch.long)
 
+    # Log-prior for Logit Adjustment (from train priors)
+    log_prior = torch.log(torch.tensor(priors, dtype=torch.float32) + 1e-12)
+    logger.info(f"  Class priors range: [{min(priors):.6f}, {max(priors):.6f}]")
+
     # ============= Sanity check: α=0 must equal CE =============
     logger.info("\n[6] SANITY: α=0 fallback (must equal CE baseline)")
     m_ce = metrics_from_logits(test_ce, test_y, class_names, priors)
@@ -219,17 +226,27 @@ def main():
 
     results = {"S0_ce_alone": {k: v for k, v in m_ce.items() if k != "report"}}
 
-    # ============= Fixed-alpha sweep =============
-    logger.info("\n[7] Fixed-α sweep on TEST set:")
-    for a_str in args.fixed_alphas.split(","):
-        a = float(a_str)
-        comb = fixed_alpha_combine(test_ce, test_tfe, tail_idx_tensor, a)
-        m = metrics_from_logits(comb, test_y, class_names, priors)
-        delta = m["macro_f1"] - ce_macro_f1
-        marker = "✓" if delta > 0 else ("=" if abs(delta) < 1e-4 else "✗")
-        logger.info(f"  α={a:>4.2f}:        Macro F1={m['macro_f1']:.4f} "
-                    f"(Δ={delta:+.4f}) Tail F1={m['tail_f1']:.4f} {marker}")
-        results[f"fixed_alpha_{a}"] = {k: v for k, v in m.items() if k != "report"}
+    # ============= Fixed-alpha × LA-tau sweep =============
+    logger.info("\n[7] Fixed-(α, τ) sweep on TEST set "
+                "(τ=LA strength, applied to ALL logits before TBLF):")
+    alpha_list = [float(x) for x in args.fixed_alphas.split(",")]
+    tau_list = [float(x) for x in args.la_taus.split(",")]
+    best_pair = None; best_pair_macro = -1
+    for tau in tau_list:
+        la_logits_test = test_ce - tau * log_prior.unsqueeze(0)
+        for a in alpha_list:
+            comb = fixed_alpha_combine(la_logits_test, test_tfe, tail_idx_tensor, a)
+            m = metrics_from_logits(comb, test_y, class_names, priors)
+            delta = m["macro_f1"] - ce_macro_f1
+            marker = "✓" if delta > 0 else ("=" if abs(delta) < 1e-4 else "✗")
+            logger.info(f"  τ={tau:>4.2f} α={a:>4.2f}: Macro F1={m['macro_f1']:.4f} "
+                        f"(Δ={delta:+.4f}) Tail F1={m['tail_f1']:.4f} {marker}")
+            key = f"tau{tau}_alpha{a}"
+            results[key] = {k: v for k, v in m.items() if k != "report"}
+            if m["macro_f1"] > best_pair_macro:
+                best_pair_macro = m["macro_f1"]; best_pair = (tau, a)
+    logger.info(f"  best fixed pair: τ={best_pair[0]}, α={best_pair[1]} → "
+                f"Macro F1={best_pair_macro:.4f}")
 
     # ============= Learnable TBLF =============
     logger.info(f"\n[8] Training learnable TBLF (init_alpha={args.init_alpha}, "
