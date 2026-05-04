@@ -83,21 +83,28 @@ def parse_args():
                    help="Initial confidence threshold; below it, consultation triggers")
     p.add_argument("--gate_init_alpha", type=float, default=10.0,
                    help="Initial sharpness of the sigmoid gate")
-    p.add_argument("--gate_reg", type=float, default=0.01,
-                   help="L1 penalty on gate activation (encourage sparsity, prefer Tier 1)")
+    p.add_argument("--gate_reg", type=float, default=0.0,
+                   help="L1 penalty on gate activation; default 0 to avoid collapsing the gate")
+    p.add_argument("--gate_min", type=float, default=0.2,
+                   help="Lower bound for learned threshold (prevents gate→0 collapse)")
+    p.add_argument("--gate_max", type=float, default=0.85,
+                   help="Upper bound for learned threshold")
 
     # Bidding game
-    p.add_argument("--game_alpha", type=float, default=0.3,
+    p.add_argument("--game_alpha", type=float, default=0.1,
                    help="Weight of game loss (utility regularization)")
     p.add_argument("--expert_costs", type=str, default="0.1,0.5,1.0")
     p.add_argument("--learnable_costs", action="store_true")
+    p.add_argument("--bidder_hidden", type=int, default=64,
+                   help="Hidden dim of bidder MLP (smaller = less overfit risk)")
 
     # Training
-    p.add_argument("--max_epochs", type=int, default=30)
-    p.add_argument("--patience", type=int, default=7)
+    p.add_argument("--max_epochs", type=int, default=15)
+    p.add_argument("--patience", type=int, default=4)
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--weight_decay", type=float, default=1e-3,
+                   help="Higher weight decay to prevent bidder overfitting on val")
 
     # General
     p.add_argument("--seed", type=int, default=42)
@@ -128,24 +135,32 @@ class ConfidenceGate(nn.Module):
         c ∈ [0, 1] is the primary expert's confidence (max prob).
         - When c >> threshold: gate → 0 (primary handles it).
         - When c << threshold: gate → 1 (consultation triggers).
-        - alpha controls the transition sharpness.
 
-    Both threshold and alpha are reparameterized to keep them in valid ranges:
-        threshold = sigmoid(raw_threshold)  ∈ (0, 1)
+    Threshold is BOUNDED in [t_min, t_max] (default [0.2, 0.85]) to prevent the
+    optimizer from finding the trivial collapsing solution threshold→0
+    (gate always 0, output ≡ CE).
+
+    Reparameterizations:
+        threshold = t_min + (t_max - t_min) * sigmoid(raw_threshold)
         alpha     = softplus(raw_alpha)     > 0
     """
 
-    def __init__(self, init_threshold: float = 0.7, init_alpha: float = 10.0):
+    def __init__(self, init_threshold: float = 0.7, init_alpha: float = 10.0,
+                 t_min: float = 0.2, t_max: float = 0.85):
         super().__init__()
-        # Inverse-sigmoid for threshold init
-        raw_t = float(np.log(init_threshold / (1 - init_threshold)))
-        # Inverse-softplus for alpha init: softplus(x) = log(1+exp(x)) → x = log(exp(a)-1)
+        assert t_min < init_threshold < t_max, \
+            f"init_threshold={init_threshold} must be in ({t_min}, {t_max})"
+        self.t_min = t_min
+        self.t_max = t_max
+        # Inverse of: t_min + (t_max - t_min)*sigmoid(raw) = init_threshold
+        rel = (init_threshold - t_min) / (t_max - t_min)
+        raw_t = float(np.log(rel / (1 - rel)))
         raw_a = float(np.log(np.expm1(init_alpha)))
         self.raw_threshold = nn.Parameter(torch.tensor(raw_t, dtype=torch.float32))
         self.raw_alpha = nn.Parameter(torch.tensor(raw_a, dtype=torch.float32))
 
     def get_threshold(self):
-        return torch.sigmoid(self.raw_threshold)
+        return self.t_min + (self.t_max - self.t_min) * torch.sigmoid(self.raw_threshold)
 
     def get_alpha(self):
         return F.softplus(self.raw_alpha)
@@ -291,8 +306,11 @@ def main():
 
     # Trainable modules
     feat_dim = expert_a[0].feat_dim
-    bidders = [BiddingNetwork(in_dim=feat_dim).to(device) for _ in range(3)]
-    gate_module = ConfidenceGate(args.gate_init_threshold, args.gate_init_alpha).to(device)
+    # Use smaller bidder hidden size to reduce overfitting risk
+    bidders = [BiddingNetwork(in_dim=feat_dim, hidden_dim=args.bidder_hidden).to(device)
+               for _ in range(3)]
+    gate_module = ConfidenceGate(args.gate_init_threshold, args.gate_init_alpha,
+                                  t_min=args.gate_min, t_max=args.gate_max).to(device)
 
     # Costs
     if args.learnable_costs:
